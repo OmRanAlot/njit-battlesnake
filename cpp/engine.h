@@ -587,12 +587,18 @@ inline double evaluate(const Board &b) {
     }
   }
 
-  // Graduated trapped penalty — starts applying when reachable space is less
-  // than twice body length, scaling smoothly to -500 as space approaches 0.
-  // This avoids the sharp phase transition at length=11 where the old binary
-  // threshold would suddenly trigger.
-  if (my_space < me.length * 2) {
-    double ratio = (double)my_space / (double)(me.length * 2);
+  // Graduated trapped penalty — use actual flood-fill reachable space from
+  // our head, NOT Voronoi territory. Voronoi counts cells geometrically closer
+  // to our head but ignores whether our own body blocks them. When the snake
+  // curls into a shrinking corridor, its Voronoi count stays high (all the
+  // cells on "our side") while actual reachable space collapses — causing the
+  // old code to never trigger this penalty and the snake to keep turning into
+  // its own trap. Using flood fill correctly detects the shrinking corridor.
+  Bitboard head_start;
+  head_start.set(head_idx);
+  int actual_reachable = flood_fill(head_start, walls);
+  if (actual_reachable < me.length * 2) {
+    double ratio = (double)actual_reachable / (double)(me.length * 2);
     score -= (1.0 - ratio) * 500.0;
   }
 
