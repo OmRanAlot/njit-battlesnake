@@ -1,0 +1,20 @@
+# Windows reserved device name (created accidentally by cmd redirects)
+nul
+NUL
+
+# Compiled artifacts
+*.so
+*.dll
+*.exe
+*.o
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
