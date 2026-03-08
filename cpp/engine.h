@@ -566,6 +566,20 @@ inline double evaluate(const Board &b) {
 
   double score = 0.0;
 
+  // Growth mode: aggressively seek food when small or significantly outgunned.
+  // Triggers if length < 9, OR any alive opponent is 5+ units longer than us.
+  bool growth_mode = (me.length < 9);
+  if (!growth_mode) {
+    for (int i = 0; i < b.num_snakes; i++) {
+      if (i == b.my_index || !b.snakes[i].alive)
+        continue;
+      if (b.snakes[i].length >= me.length + 2) {
+        growth_mode = true;
+        break;
+      }
+    }
+  }
+
   // Build walls for flood fill
   Bitboard walls = build_walls(b);
 
@@ -617,32 +631,62 @@ inline double evaluate(const Board &b) {
     }
   }
 
-  // 3. Food proximity (activates when health < 30 or when length is less than
-  // 8)
-  if ((me.health < 30 || me.length < 8) && b.num_food > 0) {
+  // 3. Food proximity
+  // Growth mode: always active, high weight (1.5), only counts food inside our
+  // reachable flood-fill area ("safely" — no point chasing food we can't reach
+  // without getting trapped). Falls back to nearest food if none are reachable.
+  // Normal mode: activates when health < 30 or length < 8, weight 0.25.
+  if (b.num_food > 0 && (growth_mode || me.health < 30 || me.length < 8)) {
+    double food_weight = growth_mode ? 1.5 : 0.25;
     int min_dist = 999;
-    for (int f = 0; f < b.num_food; f++) {
-      int dist = abs(hx - b.food_x[f]) + abs(hy - b.food_y[f]);
-      if (dist < min_dist)
-        min_dist = dist;
+
+    if (growth_mode) {
+      // Flood fill from our head to find which food is actually reachable.
+      Bitboard head_start;
+      head_start.set(head_idx);
+      Bitboard reachable = flood_fill_board(head_start, walls);
+      for (int f = 0; f < b.num_food; f++) {
+        if (!reachable.get(coord_to_idx(b.food_x[f], b.food_y[f])))
+          continue;
+        int dist = abs(hx - b.food_x[f]) + abs(hy - b.food_y[f]);
+        if (dist < min_dist)
+          min_dist = dist;
+      }
+      // Fallback: if all food is cut off, use nearest food anyway so we still
+      // try to escape rather than freezing.
+      if (min_dist == 999) {
+        for (int f = 0; f < b.num_food; f++) {
+          int dist = abs(hx - b.food_x[f]) + abs(hy - b.food_y[f]);
+          if (dist < min_dist)
+            min_dist = dist;
+        }
+      }
+    } else {
+      for (int f = 0; f < b.num_food; f++) {
+        int dist = abs(hx - b.food_x[f]) + abs(hy - b.food_y[f]);
+        if (dist < min_dist)
+          min_dist = dist;
+      }
     }
-    score -= min_dist * 0.25;
+
+    if (min_dist < 999)
+      score -= min_dist * food_weight;
   }
 
   // 4. Edge penalty
   if (hx == 0 || hx == BOARD_W - 1)
-    score -= 2.5;
+    score -= 4.5;
   else if (hx == 1 || hx == BOARD_W - 2)
     score -= 1.5;
 
   if (hy == 0 || hy == BOARD_H - 1)
-    score -= 2.5;
+    score -= 4.5;
   else if (hy == 1 || hy == BOARD_H - 2)
     score -= 1.5;
 
   // 5. Corner penalty
   if ((hx == 0 || hx == BOARD_W - 1) && (hy == 0 || hy == BOARD_H - 1)) {
-    score -= 7.0;
+    score -= 9.0;
   }
 
   // 5b. Center attraction — gentle pull toward board center to prevent
@@ -651,6 +695,7 @@ inline double evaluate(const Board &b) {
   score -= center_dist * 0.4;
 
   // 6. Aggression: chase smaller snakes, flee larger
+  // In growth mode, chasing is deprioritized — eating food matters more.
   for (int i = 0; i < b.num_snakes; i++) {
     if (i == b.my_index || !b.snakes[i].alive)
       continue;
@@ -658,11 +703,18 @@ inline double evaluate(const Board &b) {
         abs(hx - b.snakes[i].body_x[0]) + abs(hy - b.snakes[i].body_y[0]);
     if (dist > 0) {
       if (me.length > b.snakes[i].length) {
-        // Chase smaller snakes (closer = better)
-        score += 2.5 / dist;
+        // Chase smaller snakes — suppressed in growth mode (food first)
+        score += (growth_mode ? 0.5 : 2.5) / dist;
       } else {
-        // Flee larger snakes (closer = worse)
-        score -= 4.5 / dist;
+        // Flee equal-or-larger snakes. Scale by the length gap: a snake
+        // that's 5 units longer is vastly more dangerous than one that's equal.
+        // Base weight 9.0, +3.0 per extra unit of length gap.
+        // Also 1.5× in growth mode since we're especially vulnerable then.
+        int gap = b.snakes[i].length - me.length;
+        double flee_weight = 9.0 + gap * 3.0;
+        if (growth_mode)
+          flee_weight *= 1.5;
+        score -= flee_weight / dist;
       }
     }
   }
@@ -678,10 +730,16 @@ inline double evaluate(const Board &b) {
       continue;
     int ohx = b.snakes[i].body_x[0], ohy = b.snakes[i].body_y[0];
     int head_dist = abs(hx - ohx) + abs(hy - ohy);
-    if (head_dist <= 2.5) {
+    // Range scales with threat: equal/slightly-longer at dist<=3,
+    // much-longer snakes felt at dist<=5 so we never drift into range.
+    int gap = b.snakes[i].length - me.length;
+    int danger_range = (gap >= 3) ? 5 : 3;
+    if (head_dist > 0 && head_dist <= danger_range) {
       if (b.snakes[i].length >= me.length) {
-        // We'd lose or tie — avoid this position hard
-        score -= 200.0 / head_dist;
+        // We'd lose or tie. Base penalty + length-gap scaling so a snake
+        // that's 5 units longer is felt even from across the danger range.
+        double penalty = 600.0 + gap * 80.0;
+        score -= penalty / head_dist;
       } else {
         // We'd win — this is a kill opportunity
         score += 10.0 / head_dist;
@@ -874,12 +932,60 @@ inline int flood_fill_best_move(const Board &b, int snake_idx) {
 }
 
 // ============================================================
+// Nearest opponent finder
+// Returns the index of the most dangerous opponent to model adversarially.
+// Priority 1: nearest equal/larger snake (they can kill us — highest threat).
+// Priority 2: nearest smaller snake (fallback when we're the largest).
+// Modeling the actual threat adversarially is the most important property;
+// a nearby smaller snake is far less dangerous than a farther larger one.
+// ============================================================
+
+inline int find_nearest_opponent(const Board &b) {
+  if (!b.snakes[b.my_index].alive)
+    return -1;
+  const Snake &me = b.snakes[b.my_index];
+  int mx = me.body_x[0], my_y = me.body_y[0];
+
+  // Pass 1: nearest snake that is >= our length (can kill us on head-on)
+  int nearest = -1, best_dist = 9999;
+  for (int i = 0; i < b.num_snakes; i++) {
+    if (i == b.my_index || !b.snakes[i].alive)
+      continue;
+    if (b.snakes[i].length < me.length)
+      continue; // skip smaller — not a lethal head-on threat
+    int dist =
+        abs(mx - b.snakes[i].body_x[0]) + abs(my_y - b.snakes[i].body_y[0]);
+    if (dist < best_dist) {
+      best_dist = dist;
+      nearest = i;
+    }
+  }
+
+  // Pass 2: no equal/larger snakes alive — fall back to nearest of any size
+  if (nearest == -1) {
+    for (int i = 0; i < b.num_snakes; i++) {
+      if (i == b.my_index || !b.snakes[i].alive)
+        continue;
+      int dist =
+          abs(mx - b.snakes[i].body_x[0]) + abs(my_y - b.snakes[i].body_y[0]);
+      if (dist < best_dist) {
+        best_dist = dist;
+        nearest = i;
+      }
+    }
+  }
+
+  return nearest;
+}
+
+// ============================================================
 // Minimax with Alpha-Beta Pruning + Optimizations
 // - PV-move ordering from previous iteration
 // - Late Move Reductions (LMR)
 // - Reduced opponent branching at deeper depths
 // - Lightweight opponent move ordering at deep nodes
 // - Killer move heuristic
+// - Nearest opponent modeled as true adversary (adversarial search)
 // ============================================================
 
 static const int MAX_DEPTH = 25;
@@ -1014,18 +1120,36 @@ inline double minimax(Board &b, int depth, double alpha, double beta,
         }
       }
     } else {
-      // Lightweight: just check validity, use center distance for ordering
+      // Lightweight: still filter head-danger zones even at deep nodes.
+      // Without this, the search plans moves into cells adjacent to equal/larger
+      // heads, relying solely on eval's penalty — which food/space can override.
+      Bitboard lw_danger = build_walls_with_head_danger(b);
       for (int d = 0; d < 4; d++) {
         int nx = hx + DX[d];
         int ny = hy + DY[d];
         if (!in_bounds(nx, ny))
           continue;
         int idx = coord_to_idx(nx, ny);
-        if (safe_walls.get(idx))
+        if (lw_danger.get(idx))
           continue;
         int cdist = abs(nx - BOARD_W / 2) + abs(ny - BOARD_H / 2);
         moves[num_moves] = {d, 0, cdist};
         num_moves++;
+      }
+      // Fallback: if danger walls block everything (truly cornered), use safe walls
+      if (num_moves == 0) {
+        for (int d = 0; d < 4; d++) {
+          int nx = hx + DX[d];
+          int ny = hy + DY[d];
+          if (!in_bounds(nx, ny))
+            continue;
+          int idx = coord_to_idx(nx, ny);
+          if (safe_walls.get(idx))
+            continue;
+          int cdist = abs(nx - BOARD_W / 2) + abs(ny - BOARD_H / 2);
+          moves[num_moves] = {d, 0, cdist};
+          num_moves++;
+        }
       }
     }
 
@@ -1072,6 +1196,9 @@ inline double minimax(Board &b, int depth, double alpha, double beta,
       // At deeper depths, reduce opponent branching to top-1 move
       // to dramatically cut the branching factor
       int max_opp_keep = (depth <= 2) ? 1 : 2;
+      // The nearest opponent is modeled adversarially: all valid moves
+      // enumerated so we minimize over their worst-case play.
+      int nearest_opp = find_nearest_opponent(copy);
 
       // Pre-compute opponent moves
       int opp_moves[MAX_SNAKES][4];
@@ -1087,7 +1214,9 @@ inline double minimax(Board &b, int depth, double alpha, double beta,
           // Deep node: fast move gen, no flood fill
           int fast_moves[4];
           int n = get_opp_moves_fast(copy, i, copy_walls, fast_moves);
-          int keep = (n > max_opp_keep) ? max_opp_keep : n;
+          // Nearest opponent gets all moves (adversarial); others are capped.
+          int keep =
+              (i == nearest_opp) ? n : ((n > max_opp_keep) ? max_opp_keep : n);
           for (int k = 0; k < keep; k++)
             opp_moves[i][k] = fast_moves[k];
           num_opp_moves[i] = keep;
@@ -1120,7 +1249,10 @@ inline double minimax(Board &b, int depth, double alpha, double beta,
             }
           }
 
-          int keep = (o_num > max_opp_keep) ? max_opp_keep : o_num;
+          // Nearest opponent gets all moves (adversarial); others are capped.
+          int keep = (i == nearest_opp)
+                         ? o_num
+                         : ((o_num > max_opp_keep) ? max_opp_keep : o_num);
           if (keep == 0) {
             opp_moves[i][0] = 0;
             num_opp_moves[i] = 1;
@@ -1399,6 +1531,9 @@ inline int find_best_move(Board &b, int timeout_ms) {
 
       // Reduce opponent branching at deeper depths
       int max_opp_keep = (depth <= 2) ? 1 : 2;
+      // The nearest opponent is modeled adversarially: all valid moves
+      // enumerated so we minimize over their worst-case play.
+      int nearest_opp = find_nearest_opponent(copy);
 
       int(&opp_moves_arr)[MAX_SNAKES][4] = saved_opp_moves[m];
       int(&num_opp_moves)[MAX_SNAKES] = saved_num_opp_moves[m];
@@ -1413,7 +1548,9 @@ inline int find_best_move(Board &b, int timeout_ms) {
           // Fast move gen at deep nodes
           int fast_moves[4];
           int n = get_opp_moves_fast(copy, i, copy_walls, fast_moves);
-          int keep = (n > max_opp_keep) ? max_opp_keep : n;
+          // Nearest opponent gets all moves (adversarial); others are capped.
+          int keep =
+              (i == nearest_opp) ? n : ((n > max_opp_keep) ? max_opp_keep : n);
           for (int k = 0; k < keep; k++)
             opp_moves_arr[i][k] = fast_moves[k];
           num_opp_moves[i] = keep;
@@ -1449,7 +1586,10 @@ inline int find_best_move(Board &b, int timeout_ms) {
             }
           }
 
-          int keep = (o_num > max_opp_keep) ? max_opp_keep : o_num;
+          // Nearest opponent gets all moves (adversarial); others are capped.
+          int keep = (i == nearest_opp)
+                         ? o_num
+                         : ((o_num > max_opp_keep) ? max_opp_keep : o_num);
           if (keep == 0) {
             opp_moves_arr[i][0] = 0;
             num_opp_moves[i] = 1;
