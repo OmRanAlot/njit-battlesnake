@@ -167,9 +167,9 @@ async def end(request: Request):
 
 
 if __name__ == "__main__":
+    # Priority: CLI arg → PORT env var (Railway/Render) → 8080
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
     else:
-        port = 8000
-    # Running on 8000 to not conflict with the main engine on 8000 or the opponent on 8001
+        port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)

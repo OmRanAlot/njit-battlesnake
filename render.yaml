@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: battlesnake-njit
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    # Render injects PORT automatically for web services; no need to set it here
