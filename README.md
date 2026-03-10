@@ -1,42 +1,96 @@
 # Battlesnake NJIT 2026
 
-A competitive [Battlesnake](https://play.battlesnake.com/) bot built for **Standard mode** (4 snakes, 11×11 board, 500ms move timeout).
+A competitive AI bot for [Battlesnake](https://play.battlesnake.com/) — a real-time multiplayer game where snakes compete for food and survival on an 11×11 board. Built for **Standard mode** (4 snakes, 500ms move deadline).
+
+The bot is designed to play at a high level using a custom game-tree search engine written in C++, called from a Python web server via `ctypes`.
+
+---
+
+## How It Works
+
+Every turn, the Battlesnake platform sends a JSON snapshot of the board to the server. The bot must respond with a move (`up`, `down`, `left`, or `right`) within **500ms** — including network round-trip time. Missing the deadline means repeating the last move, which can be fatal.
+
+```
+Battlesnake Platform
+       │  POST /move (JSON board state)
+       ▼
+  Python (FastAPI)
+  ├─ Parse JSON into C struct
+  ├─ Track game state (who ate last turn, etc.)
+  └─ Call C++ engine via ctypes
+       │
+       ▼
+  C++ Engine (~420ms budget)
+  ├─ Build bitboard representation
+  ├─ Run iterative deepening minimax
+  └─ Return best direction (0–3)
+       │
+       ▼
+  {"move": "right"}  →  Battlesnake Platform
+```
+
+---
 
 ## Architecture
 
-**FastAPI (Python) + C++ search engine (via ctypes)**
+**Python server** (`server.py`) handles the HTTP layer using FastAPI. It parses the Battlesnake JSON into a flat C struct (`CBoard`) and calls into the compiled C++ engine via `ctypes`. It also tracks inter-turn state (e.g., whether a snake ate last turn, which changes tail behavior).
 
-- **Python server** (`server.py`) — handles HTTP endpoints, parses the Battlesnake JSON API, and calls into the C++ engine
-- **C++ engine** (`cpp/engine.h`) — header-only engine containing the board representation, search algorithm, and evaluation function, compiled into a shared library (`libsnake.so`)
+**C++ engine** (`cpp/engine.h`) contains the full game intelligence — board representation, simulation, evaluation, and search. It's compiled into a shared library (`libsnake.so` / `libsnake.dll`) and loaded at startup.
 
-### How It Works
+---
 
-1. Battlesnake platform sends board state as JSON to `POST /move`
-2. Python parses JSON into a `CBoard` ctypes struct
-3. C++ engine runs **iterative deepening paranoid minimax** with alpha-beta pruning under a ~420ms time budget
-4. Engine returns best direction → Python responds with `{"move": "up"|"down"|"left"|"right"}`
+## Engine Deep Dive
 
-### Engine Internals
+### Bitboard Representation
 
-| Component | Description |
+The 11×11 board (121 cells) is encoded as a 128-bit value using two `uint64_t` integers. This lets the engine perform operations on the entire board in a handful of CPU instructions — checking collisions, expanding frontiers, and masking regions are all single bitwise ops.
+
+```
+Bit index = y * 11 + x
+(0,0) = bottom-left  |  (10,10) = top-right
+```
+
+### Flood Fill
+
+Board reachability is computed via a bitboard-based BFS — expanding all four directions simultaneously using bit shifts and masks. This runs in O(board diameter) time with no heap allocation, making it fast enough to call many times per search.
+
+### Voronoi Territory Evaluation
+
+The evaluator runs a simultaneous multi-source BFS from all snake heads to compute **Voronoi territory** — the set of cells each snake would reach first assuming optimal movement. This gives a much more accurate measure of board control than simply counting reachable squares.
+
+### Paranoid Minimax with Alpha-Beta Pruning
+
+The search uses **paranoid minimax**: our snake maximizes its score while all opponents are treated as a coordinated adversary minimizing it. Alpha-beta pruning cuts branches that can't affect the final decision, enabling deeper search within the time budget.
+
+**Iterative deepening** runs the search at depth 1, 2, 3… and saves the best move from the last completed depth. If time runs out mid-search, the previous best move is used as a safe fallback.
+
+### Evaluation Heuristic
+
+Each board state is scored using a weighted combination of features:
+
+| Feature | Weight | Notes |
+|---|---|---|
+| Voronoi territory (flood fill area) | 0.12 | Primary measure of board control |
+| Trapped penalty | −500 | Triggered when space < body length |
+| Length advantage | 7.0 | Longer snake = safer head-to-head |
+| Food proximity | 0.2 | Active only when health < 50 |
+| Edge proximity | −4.0 / −1.5 | Penalizes walls and near-wall positions |
+| Corner penalty | −5.0 | Corners are especially dangerous |
+| Aggression | 3.0 | Chase smaller snakes, evade larger ones |
+| Kill bonus | 20.0 | Per eliminated opponent |
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
 |---|---|
-| **Bitboard** | 128-bit (two `uint64_t`) representation of the 11×11 = 121 cell board |
-| **Flood fill** | Bitboard-based BFS via bit shifts — O(board diameter) |
-| **Evaluation** | Weighted heuristic: space (flood fill), length advantage, food proximity, edge/corner penalties, aggression, kill bonus |
-| **Search** | Paranoid minimax + alpha-beta. Iterative deepening (depth 1, 2, 3…) until timeout. Falls back to flood-fill-best if depth 1 doesn't complete |
-| **C API** | `get_best_move(CBoard*)` — single entry point called from Python via ctypes |
+| Web server | Python 3, FastAPI, Uvicorn |
+| Game engine | C++17, compiled as a shared library |
+| Interop | Python `ctypes` — zero-copy struct passing |
+| Build | `g++ -O2 -shared` via `build.sh` |
 
-### Coordinate System
-
-- `(0,0)` = bottom-left, `(10,10)` = top-right
-- Bit index = `y * 11 + x`
-- UP = y+1, DOWN = y-1, LEFT = x-1, RIGHT = x+1
-
-## Prerequisites
-
-- **Python 3.8+** with `fastapi` and `uvicorn`
-- **g++ 7+** with C++17 support
-- **Battlesnake CLI** (optional, for local testing) — [install guide](https://github.com/BattlesnakeOfficial/rules/tree/main/cli)
+---
 
 ## Setup & Run
 
@@ -44,27 +98,27 @@ A competitive [Battlesnake](https://play.battlesnake.com/) bot built for **Stand
 # 1. Install Python dependencies
 pip install fastapi uvicorn
 
-# 2. Compile the C++ engine (MUST re-run after any .h/.cpp change)
+# 2. Compile the C++ engine
 bash build.sh
 
-# 3. Start the server (port 8000)
+# 3. Start the server (default port 8080)
 python server.py
 ```
 
-## Local Testing
+### Local Testing
 
-Solo game (just your snake):
+Run a solo game:
 ```bash
-battlesnake play -W 11 -H 11 --name me --url http://localhost:8000
+battlesnake play -W 11 -H 11 --name me --url http://localhost:8080
 ```
 
-Full 4-snake game with browser visualization:
+Run a full 4-snake game with browser visualization:
 ```bash
 battlesnake play -W 11 -H 11 --browser \
-  --name me --url http://localhost:8000 \
-  --name b1 --url http://localhost:8000 \
-  --name b2 --url http://localhost:8000 \
-  --name b3 --url http://localhost:8000
+  --name me  --url http://localhost:8080 \
+  --name b1  --url http://localhost:8080 \
+  --name b2  --url http://localhost:8080 \
+  --name b3  --url http://localhost:8080
 ```
 
 Run engine smoke tests:
@@ -72,53 +126,27 @@ Run engine smoke tests:
 python test_engine.py
 ```
 
-## Known Problems & Key Issues
+---
 
-### 1. Opponent Modeling is Simplistic — HIGH IMPACT
+## Project Structure
 
-Opponents are assumed to pick their flood-fill-best move at each search node. The engine does **not** consider worst-case opponent plays. This means it can be blindsided by aggressive opponents who cut off space intentionally.
+```
+├── server.py          # FastAPI server — HTTP, JSON parsing, C++ bridge
+├── build.sh           # Compiles C++ → libsnake.so / libsnake.dll
+├── test_engine.py     # Smoke tests (wall avoidance, food-seeking, 4-snake scenarios)
+├── cpp/
+│   ├── engine.h       # Entire C++ engine (header-only)
+│   └── engine.cpp     # Entry point — just #includes engine.h
+└── CLAUDE.md          # Developer notes
+```
 
-**Fix:** Enumerate top 2-3 opponent moves and minimize over them (true paranoid minimax). Trades branching factor (~3× per opponent) for much better tactical accuracy.
-
-## Recently Resolved Issues
-
-### 2. Voronoi Territory in Evaluation
-We implemented a simultaneous BFS from all snake heads. The evaluation now measures true board control by calculating cells that we can reach *first*, rather than merely counting reachable cells.
-
-### 3. No Tail-Chasing Fallback — MEDIUM IMPACT
-
-When there's no safe food path and health is fine, the snake has no default safe behavior. Chasing your own tail is always safe (the tail moves away each turn).
-
-**Fix:** Add A* pathfinding from head to own tail as an eval feature / fallback strategy.
-
-### 4. No Transposition Table — MEDIUM IMPACT
-
-Positions reached via different move orders are re-searched from scratch, wasting time.
-
-**Fix:** Add Zobrist hashing + a fixed-size transposition table (2^20 entries) to cache search results. Expected ~1.5× deeper search within the same time budget.
-
-### 5. Food Spawn Not Simulated — LOW IMPACT
-
-The simulator doesn't spawn new food after consumption. Slightly distorts long lookahead but irrelevant at depth 3-5.
-
-### 6. Move Ordering is Basic — LOW IMPACT
-
-Moves are currently ordered only by flood fill score. Better ordering (PV-move from previous iteration, killer heuristic, history heuristic) would improve alpha-beta cutoffs.
+---
 
 ## Troubleshooting
 
-| Symptom | Cause & Fix |
+| Symptom | Fix |
 |---|---|
-| `libsnake.so not found` | Run `bash build.sh` to compile the engine |
-| Snake always goes down | JSON parsing is mapping coordinates wrong — print `data["you"]["body"]` in `server.py` to debug |
-| Snake times out (>500ms) | Reduce `timeout_ms` safety margin in `server.py` (currently 80ms). Check for excessive flood fills in eval |
-| Compilation errors | Ensure g++ supports C++17: `g++ --version` should be 7+ |
-| Wrong move direction | Coordinate mismatch — verify DX/DY arrays in `engine.h` match: UP=y+1, DOWN=y-1 |
-
-## Important Dev Notes
-
-- **All C++ lives in `engine.h`** (header-only). `engine.cpp` just `#include`s it.
-- Use `inline` on all functions in the header to avoid linker errors.
-- **Always rebuild** after C++ changes: `bash build.sh`
-- The `CBoard`/`CSnake` structs in `engine.h` **must exactly match** the ctypes definitions in `server.py` (field order, types, array sizes). Change one → change both.
-- Bitboard operations must mask with `FULL_MASK` (121 bits) and edge masks to prevent bit wraparound.
+| `libsnake.so not found` | Run `bash build.sh` |
+| Snake always moves down | Check JSON coordinate parsing — print `data["you"]["body"]` in `server.py` |
+| Snake times out | Reduce `TIMEOUT_MS` in `server.py` (currently 400ms budget) |
+| Compilation errors | Ensure g++ 7+ with C++17: `g++ --version` |
